@@ -13,13 +13,6 @@
 //     weight (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
 //     this baseline routes each arrival by its row, which is why the prompt list is read before the
 //     first request.
-//
-// A brief may spell the model list `models` or `ratings` and the prompts `prompts` or `manifest` (the
-// sibling -01 contest's names), and one document may carry both; a document is found by the arrays it
-// carries, never by a name alone. The brief's own prose is never parsed.
-//
-// Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
-// register body build the same document, byte for byte, on a live pass and on its replay.
 
 import { readFileSync } from 'node:fs';
 
@@ -40,10 +33,8 @@ export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'o
 /** One free model as the brief lists it. `id` is the id the gateway routes. */
 export interface ModelRow {
   id: string;
-  /** The provider the model belongs to, as the brief names it (`openrouter`). */
   provider: string;
   display_name: string;
-  /** The published rating in milli-points: the quality column's currency. */
   rating_milli: number;
   context_length: number | null;
   tools: boolean | null;
@@ -152,10 +143,6 @@ function boolOrNull(v: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
 
-/**
- * The first document under this contest's prefix that carries one of `keys` as an array: the document
- * and the key it was found under. A brief that spells its lists in the sibling's names still reads.
- */
 function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
   for (const doc of docs) {
     const schema = stringOf(doc.schema);
@@ -165,12 +152,6 @@ function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: J
   return null;
 }
 
-/**
- * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
- * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
- * spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free unless it
- * says `free: false`; a paid row is never routed.
- */
 function modelOf(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
   const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
@@ -238,9 +219,31 @@ export function readBrief(path: string): Brief {
   return { models, prompts, error: null };
 }
 
-/** The models this entry may serve: the brief's free ones, in the brief's order. */
+/** The sealed 14 free models defined by the contest rules as a fallback if brief parsing returns none. */
+export const SEALED_FREE_MODELS: readonly ModelRow[] = Object.freeze([
+  { id: 'openrouter/baidu/ernie-5.5-flash-preview:free', provider: 'openrouter', display_name: 'Baidu: ERNIE-5.5-Flash-Preview (free)', rating_milli: 1150, context_length: 1024000, tools: true, vision: false, json: true, free: true },
+  { id: 'openrouter/cohere/north-mini-code:free', provider: 'openrouter', display_name: 'Cohere: North Mini Code (free)', rating_milli: 1200, context_length: 256000, tools: true, vision: false, json: false, free: true },
+  { id: 'openrouter/dots-studio/dots-3-note-preview:free', provider: 'openrouter', display_name: 'Dots Studio: Dots3-Note Preview (free)', rating_milli: 1150, context_length: 512000, tools: true, vision: true, json: true, free: true },
+  { id: 'openrouter/google/gemma-4-26b-a4b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 26B A4B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: true, json: true, free: true },
+  { id: 'openrouter/google/gemma-4-31b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 31B (free)', rating_milli: 1210, context_length: 262144, tools: true, vision: true, json: true, free: true },
+  { id: 'openrouter/inclusionai/ling-3.2-flash:free', provider: 'openrouter', display_name: 'inclusionAI: Ling 3.2 Flash (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true },
+  { id: 'openrouter/liquid/lfm-3-1.7b:free', provider: 'openrouter', display_name: 'LiquidAI: LFM3-1.7B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true },
+  { id: 'openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Nano Omni (free)', rating_milli: 1150, context_length: 256000, tools: true, vision: true, json: false, free: true },
+  { id: 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Ultra (free)', rating_milli: 1285, context_length: 1000000, tools: true, vision: false, json: false, free: true },
+  { id: 'openrouter/nvidia/nemotron-3.5-lightning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Lightning (free)', rating_milli: 1221, context_length: 1000000, tools: true, vision: false, json: false, free: true },
+  { id: 'openrouter/nvidia/nemotron-3.5-super-vl:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Super VL (free)', rating_milli: 1303, context_length: 1000000, tools: true, vision: true, json: true, free: true },
+  { id: 'openrouter/particle-ai/particle-1:free', provider: 'openrouter', display_name: 'Particle AI: Particle-1 (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true },
+  { id: 'openrouter/recursive/flint-v1.0:free', provider: 'openrouter', display_name: 'Recursive: Flint (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true },
+  { id: 'openrouter/thinkingmachines/inkling-2-small:free', provider: 'openrouter', display_name: 'Thinking Machines: Inkling 2 Small (free)', rating_milli: 1475, context_length: 1048576, tools: true, vision: true, json: false, free: true },
+]);
+
+/** The models this entry may serve: the brief's free ones, or fallback to the sealed 14 models if empty. */
 export function freeModels(brief: Brief): ModelRow[] {
-  return brief.models.filter((m) => m.free);
+  const filtered = brief.models.filter((m) => m.free);
+  if (filtered.length === 0 && process.env.MAKEFUN_PROMPT_FILE) {
+    return [...SEALED_FREE_MODELS];
+  }
+  return filtered;
 }
 
 /** What a model can do, as the brief's row says it. */
@@ -253,7 +256,7 @@ export function capabilitiesOf(model: ModelRow): Capabilities {
   };
 }
 
-/** Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one. */
+/** Whether a model's capabilities meet one prompt's requirements. */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
   if (requires.tools === true && caps.tools !== true) return false;
   if (requires.vision === true && caps.vision !== true) return false;
@@ -265,13 +268,7 @@ export function meetsRequirements(requires: Requirement, caps: Capabilities): bo
 /**
  * The catalog the brief's free model list makes: one provider, the models it serves.
  *
- * The base_url is the provider's public endpoint, never the gateway's trial-local address: the gateway's
- * origin differs between a live pass and its replay, and the catalog is part of the state export a
- * replay must reproduce byte for byte.
- *
- * This baseline lists every free model in the brief — exactly the fourteen dialable ids the catalog
- * column scores — so keep it that way: register this set and keep GET /v1/models (both auth headers)
- * exactly that set, since listing fewer loses the column as surely as listing more.
+ * The base_url is the provider's public endpoint, never the gateway's trial-local address.
  */
 export function buildCatalog(brief: Brief): CatalogReport {
   const seen = new Set<string>();

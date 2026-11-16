@@ -31,6 +31,7 @@ import {
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_FAILURES_REPORTED = 8;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -44,7 +45,24 @@ let manifestIndex = 0;
 interface UpstreamFailure {
   status: number;
   code: string;
-  model: string;
+  model: string | null;
+}
+
+async function extractErrorCode(upstream: Response): Promise<string> {
+  if (upstream.status === 429) return 'rate_limit_exceeded';
+  try {
+    const text = await upstream.text();
+    if (text) {
+      const parsed: unknown = JSON.parse(text);
+      if (isRecord(parsed) && isRecord(parsed.error)) {
+        if (typeof parsed.error.code === 'string' && parsed.error.code !== '') return parsed.error.code;
+        if (typeof parsed.error.type === 'string' && parsed.error.type !== '') return parsed.error.type;
+      }
+    }
+  } catch {
+    // Non-JSON or read error; fallback to standard classification
+  }
+  return upstream.status >= 500 ? 'upstream_error' : 'request_failed';
 }
 
 const failedModels = new Set<string>();
@@ -120,15 +138,15 @@ function sendJson(res: ServerResponse, status: number, body: unknown, failures: 
     'content-length': Buffer.byteLength(text),
   };
   if (failures.length > 0) {
-    headers['x-makefun-upstream-failures'] = JSON.stringify(failures);
+    headers['x-makefun-upstream-failures'] = JSON.stringify(failures.slice(0, MAX_FAILURES_REPORTED));
   }
   res.writeHead(status, headers);
   res.end(text);
 }
 
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
-  if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message));
-  else sendJson(res, status, openAIError(message, type, null));
+function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string, failures: UpstreamFailure[] = []): void {
+  if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message), failures);
+  else sendJson(res, status, openAIError(message, type, null), failures);
 }
 
 function models(req: IncomingMessage, res: ServerResponse): void {
@@ -146,11 +164,11 @@ async function dial(model: string, body: Json): Promise<Response> {
   return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
 }
 
-function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, text: string): void {
+function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, text: string, failures: UpstreamFailure[] = []): void {
   if (wire === 'anthropic') {
-    sendError(res, wire, 502, 'api_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`);
+    sendError(res, wire, 502, 'api_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`, failures);
   } else {
-    sendError(res, wire, 502, 'upstream_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`);
+    sendError(res, wire, 502, 'upstream_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`, failures);
   }
 }
 
@@ -164,8 +182,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const failures: UpstreamFailure[] = [];
   for (const candidate of candidates) {
     let upstream: Response;
+    const requestBody: Json = { ...body, model: candidate.id };
+    if (body.stream === true) {
+      requestBody.stream_options = { include_usage: true };
+    }
     try {
-      upstream = await dial(candidate.id, { ...body, model: candidate.id });
+      upstream = await dial(candidate.id, requestBody);
     } catch (err) {
       failedModels.add(candidate.id);
       failures.push({ status: 502, code: 'upstream_unreachable', model: candidate.id });
@@ -173,7 +195,8 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
     if (!upstream.ok || upstream.body === null) {
       failedModels.add(candidate.id);
-      failures.push({ status: upstream.status, code: 'upstream_error', model: candidate.id });
+      const code = await extractErrorCode(upstream);
+      failures.push({ status: upstream.status, code, model: candidate.id });
       continue;
     }
 
@@ -182,7 +205,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
-        ...(failures.length > 0 ? { 'x-makefun-upstream-failures': JSON.stringify(failures) } : {}),
+        ...(failures.length > 0 ? { 'x-makefun-upstream-failures': JSON.stringify(failures.slice(0, MAX_FAILURES_REPORTED)) } : {}),
       });
       try {
         for await (const frame of openAIStreamWithModel(upstream.body, candidate.id)) res.write(frame);
@@ -198,7 +221,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   const lastFailure = failures[failures.length - 1];
-  refused(res, 'openai', lastFailure?.status ?? 502, 'all free model candidates refused or failed');
+  refused(res, 'openai', lastFailure?.status ?? 502, 'all free model candidates refused or failed', failures);
 }
 
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -220,7 +243,8 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     }
     if (!upstream.ok || upstream.body === null) {
       failedModels.add(candidate.id);
-      failures.push({ status: upstream.status, code: 'upstream_error', model: candidate.id });
+      const code = await extractErrorCode(upstream);
+      failures.push({ status: upstream.status, code, model: candidate.id });
       continue;
     }
 
@@ -229,7 +253,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
-        ...(failures.length > 0 ? { 'x-makefun-upstream-failures': JSON.stringify(failures) } : {}),
+        ...(failures.length > 0 ? { 'x-makefun-upstream-failures': JSON.stringify(failures.slice(0, MAX_FAILURES_REPORTED)) } : {}),
       });
       try {
         for await (const event of anthropicEventsFromOpenAI(upstream.body, candidate.id)) res.write(event);
@@ -245,7 +269,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   }
 
   const lastFailure = failures[failures.length - 1];
-  refused(res, 'anthropic', lastFailure?.status ?? 502, 'all free model candidates refused or failed');
+  refused(res, 'anthropic', lastFailure?.status ?? 502, 'all free model candidates refused or failed', failures);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

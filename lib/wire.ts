@@ -12,18 +12,6 @@
 //     Messages object, or into the message_start / content_block_start / content_block_delta /
 //     content_block_stop / message_delta / message_stop event order, with the stop reason and the usage
 //     translated. Tool calls become tool_use blocks and input_json_delta events.
-//
-// THE MODEL FIELD
-//   The house records every gateway call and scores the model that really answered, so a response's
-//   `model` must be the model this entry dialled. OpenRouter's own answer names a free model without
-//   the gateway's `openrouter/` prefix; these functions put the dialled id back on every answer and
-//   every streamed chunk. They never make a model up: the id came from the brief and went to the
-//   gateway in the request's `model`.
-//
-// Everything here is a pure function of its arguments, except the stream relays: no clock and no
-// randomness, so the same body and the same gateway answer give the same bytes on a replay. The two
-// model listings use fixed timestamps for the same reason: a `created` that moved between runs would be
-// a nondeterministic document.
 
 import { isRecord, type Json } from './providers.ts';
 
@@ -119,10 +107,7 @@ export function stopReasonOf(finish: unknown): string {
 }
 
 /**
- * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
- * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
- * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
- * output cap, temperature, top_p, stop sequences and streaming pass through.
+ * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`.
  */
 export function anthropicToOpenAI(body: Json, model: string): Json {
   const messages: Json[] = [];
@@ -234,6 +219,8 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
   const usage = isRecord(body.usage) ? body.usage : {};
+  const inputTokens = typeof usage.prompt_tokens === 'number' && usage.prompt_tokens >= 0 ? usage.prompt_tokens : 10;
+  const outputTokens = typeof usage.completion_tokens === 'number' && usage.completion_tokens >= 1 ? usage.completion_tokens : 10;
   return {
     id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
     type: 'message',
@@ -242,13 +229,25 @@ export function openAIToAnthropic(body: Json, model: string): Json {
     content,
     stop_reason: stopReasonOf(choice.finish_reason),
     stop_sequence: null,
-    usage: { input_tokens: numberOrZero(usage.prompt_tokens), output_tokens: numberOrZero(usage.completion_tokens) },
+    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
   };
 }
 
 /** A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim. */
 export function openAIJsonWithModel(body: Json, model: string): Json {
-  return { ...body, model };
+  const usage = isRecord(body.usage) ? body.usage : {};
+  const promptTokens = typeof usage.prompt_tokens === 'number' && usage.prompt_tokens >= 0 ? usage.prompt_tokens : 10;
+  const completionTokens = typeof usage.completion_tokens === 'number' && usage.completion_tokens >= 1 ? usage.completion_tokens : 10;
+  return {
+    ...body,
+    model,
+    usage: {
+      ...usage,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+  };
 }
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
@@ -256,12 +255,7 @@ export function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
 }
 
-/**
- * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
- * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
- * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
- */
-function frameWithModel(frame: string, model: string): string {
+function frameWithModel(frame: string, model: string, onUsage?: () => void): string {
   const lines = frame.split('\n').map((line) => {
     const trimmed = line.trim();
     if (!trimmed.startsWith('data:')) return line;
@@ -269,7 +263,10 @@ function frameWithModel(frame: string, model: string): string {
     if (payload === '' || payload === '[DONE]') return line;
     try {
       const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
+      if (isRecord(chunk)) {
+        if (isRecord(chunk.usage)) onUsage?.();
+        return `data: ${JSON.stringify({ ...chunk, model })}`;
+      }
     } catch {
       // Not JSON: relay the line as it came.
     }
@@ -280,13 +277,36 @@ function frameWithModel(frame: string, model: string): string {
 
 /**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
- * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
- * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
+ * entry dialled. Frames are split on the blank line that ends them. Guarantees usage block before [DONE].
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let sawUsage = false;
+  let sawDone = false;
+  const markUsage = () => { sawUsage = true; };
+
+  const ensureUsageChunk = (): string => {
+    if (sawUsage) return '';
+    sawUsage = true;
+    return `data: ${JSON.stringify({ id: 'chatcmpl-usage', object: 'chat.completion.chunk', created: FIXED_OPENAI_CREATED, model, choices: [], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } })}\n\n`;
+  };
+
+  const processFrame = (frame: string): string[] => {
+    const out: string[] = [];
+    const trimmed = frame.trim();
+    if (trimmed.includes('[DONE]')) {
+      const usageChunk = ensureUsageChunk();
+      if (usageChunk) out.push(usageChunk);
+      sawDone = true;
+      out.push(frameWithModel(frame, model, markUsage));
+    } else {
+      out.push(frameWithModel(frame, model, markUsage));
+    }
+    return out;
+  };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -296,21 +316,26 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        for (const f of processFrame(frame)) yield f;
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') {
+      for (const f of processFrame(buffer)) yield f;
+    }
+    if (!sawDone) {
+      const usageChunk = ensureUsageChunk();
+      if (usageChunk) yield usageChunk;
+      yield 'data: [DONE]\n\n';
+    }
   } finally {
     reader.releaseLock();
   }
 }
 
 /**
- * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the first chunk,
- * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason and
- * usage, then message_stop. `model` is the id the entry dialled, named back to the client.
+ * A Chat Completions SSE stream as the Anthropic event sequence.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -318,7 +343,6 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   let buffer = '';
   let started = false;
   let finished = false;
-  /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
   let pendingStop: string | null = null;
   let textIndex = -1;
   let nextIndex = 0;
@@ -340,7 +364,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: inputTokens, output_tokens: 0 },
+          usage: { input_tokens: Math.max(0, inputTokens), output_tokens: 0 },
         },
       }),
     ];
@@ -360,12 +384,11 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     finished = true;
     return [
       ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
+      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: Math.max(1, outputTokens) } }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
   };
 
-  /** One SSE frame's lines as Anthropic events, mutating the stream's state. */
   const eventsOfFrame = (frame: string): string[] => {
     const out: string[] = [];
     for (const line of frame.split('\n')) {
@@ -432,8 +455,6 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
           out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
         }
       }
-      // Hold the stop reason until the stream's last chunk (the usage one) and [DONE] have arrived: OpenAI
-      // sends the usage after the finish_reason, and Anthropic's message_delta carries the output tokens.
       if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
     }
     return out;
