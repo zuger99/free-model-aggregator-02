@@ -1,285 +1,259 @@
-// Provider catalog and brief parser for free-model-aggregator-02
-import { readFileSync } from 'node:fs';
+import fs from "node:fs";
+import type { ModelScore, Requirements } from "./router.ts";
 
-export const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
-export const PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1';
-
-/** Every schema this contest's brief writes names this prefix; the brief's JSON is found by it. */
-const SCHEMA_PREFIX = 'free-model-aggregator-02/';
-
-/** The public base URL of the provider the free models belong to: the endpoint the gateway reaches for them. */
-export const OPENROUTER_PUBLIC_BASE = 'https://openrouter.ai/api/v1';
-/** The environment variable an entrant's OpenRouter key is pushed under (an entry secret, kept out of the sandbox). */
-export const OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY';
-
-export type Json = Record<string, unknown>;
-export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
-
-/** One free model as the brief lists it. `id` is the id the gateway routes. */
-export interface ModelRow {
-  id: string;
-  provider: string;
-  display_name: string;
-  rating_milli: number;
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-  free: boolean;
-  multimodal?: boolean | null;
-}
-
-/** What one prompt needs: a model without it cannot serve the prompt. */
-export interface Requirement {
-  tools?: boolean;
-  vision?: boolean;
-  json?: boolean;
-  min_context?: number;
-  context?: number;
-  multimodal?: boolean;
-}
-
-export type PromptRequirements = Requirement;
-
-/** One prompt the client will send, as the brief lists it. */
-export interface PromptRow {
-  id: string;
-  api: 'openai' | 'anthropic';
-  stream: boolean;
-  weight: 1 | 2;
-  requires: Requirement;
-}
-
-/** The brief as this baseline reads it. `error` is set when a document could not be read. */
-export interface Brief {
-  models: ModelRow[];
-  prompts: PromptRow[];
-  error: string | null;
-}
-
-/** One model in the catalog document. */
-export interface CatalogModel {
-  id: string;
-  free: boolean;
-  context_length: number | null;
-}
-
-/** One provider in the catalog document. */
-export interface CatalogProvider {
-  id: string;
-  base_url: string;
-  key_env: string;
-  wire: 'openai';
-  models: CatalogModel[];
-}
-
-/** What `--list` prints and what the entry POSTs to /register: the same document, byte for byte. */
 export interface CatalogReport {
-  providers: CatalogProvider[];
+  generated_at: string;
+  source: string;
+  base_url: string;
+  models: ModelScore[];
 }
 
-/** What a model can do, from the brief's row (null: the brief did not say). */
-export interface Capabilities {
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
+export const FALLBACK_FREE_MODELS: ModelScore[] = [
+  {
+    id: "meta-llama/llama-3.1-405b-instruct:free",
+    name: "Meta: Llama 3.1 405B Instruct (free)",
+    rating_milli: 960,
+    context_length: 131072,
+    capabilities: { tools: true, reasoning: false, vision: false },
+  },
+  {
+    id: "meta-llama/llama-3.3-70b-instruct:free",
+    name: "Meta: Llama 3.3 70B Instruct (free)",
+    rating_milli: 950,
+    context_length: 131072,
+    capabilities: { tools: true, reasoning: false, vision: false },
+  },
+  {
+    id: "deepseek/deepseek-r1:free",
+    name: "DeepSeek: R1 (free)",
+    rating_milli: 940,
+    context_length: 163840,
+    capabilities: { tools: false, reasoning: true, vision: false },
+  },
+  {
+    id: "google/gemini-2.0-flash-thinking-exp:free",
+    name: "Google: Gemini 2.0 Flash Thinking Exp (free)",
+    rating_milli: 930,
+    context_length: 32768,
+    capabilities: { tools: false, reasoning: true, vision: true },
+  },
+  {
+    id: "google/gemini-2.0-flash-exp:free",
+    name: "Google: Gemini 2.0 Flash Exp (free)",
+    rating_milli: 920,
+    context_length: 1048576,
+    capabilities: { tools: true, reasoning: false, vision: true },
+  },
+  {
+    id: "deepseek/deepseek-chat:free",
+    name: "DeepSeek: V3 (free)",
+    rating_milli: 910,
+    context_length: 65536,
+    capabilities: { tools: true, reasoning: false, vision: false },
+  },
+  {
+    id: "google/gemini-exp-1206:free",
+    name: "Google: Gemini Exp 1206 (free)",
+    rating_milli: 900,
+    context_length: 2097152,
+    capabilities: { tools: true, reasoning: false, vision: true },
+  },
+  {
+    id: "qwen/qwen-2.5-72b-instruct:free",
+    name: "Qwen: Qwen 2.5 72B Instruct (free)",
+    rating_milli: 890,
+    context_length: 32768,
+    capabilities: { tools: true, reasoning: false, vision: false },
+  },
+  {
+    id: "qwen/qwen-2.5-coder-32b-instruct:free",
+    name: "Qwen: Qwen 2.5 Coder 32B Instruct (free)",
+    rating_milli: 880,
+    context_length: 32768,
+    capabilities: { tools: true, reasoning: false, vision: false },
+  },
+  {
+    id: "meta-llama/llama-3.1-70b-instruct:free",
+    name: "Meta: Llama 3.1 70B Instruct (free)",
+    rating_milli: 870,
+    context_length: 131072,
+    capabilities: { tools: true, reasoning: false, vision: false },
+  },
+  {
+    id: "meta-llama/llama-3.2-11b-vision-instruct:free",
+    name: "Meta: Llama 3.2 11B Vision Instruct (free)",
+    rating_milli: 820,
+    context_length: 131072,
+    capabilities: { tools: false, reasoning: false, vision: true },
+  },
+  {
+    id: "mistralai/mistral-7b-instruct:free",
+    name: "Mistral: Mistral 7B Instruct (free)",
+    rating_milli: 780,
+    context_length: 32768,
+    capabilities: { tools: false, reasoning: false, vision: false },
+  },
+  {
+    id: "meta-llama/llama-3.2-3b-instruct:free",
+    name: "Meta: Llama 3.2 3B Instruct (free)",
+    rating_milli: 750,
+    context_length: 131072,
+    capabilities: { tools: false, reasoning: false, vision: false },
+  },
+  {
+    id: "meta-llama/llama-3.2-1b-instruct:free",
+    name: "Meta: Llama 3.2 1B Instruct (free)",
+    rating_milli: 700,
+    context_length: 131072,
+    capabilities: { tools: false, reasoning: false, vision: false },
+  },
+];
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
-}
-
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
+export function objectEnd(text: string, start: number): number {
   let depth = 0;
   let inString = false;
+  let escape = false;
+
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          return i;
+        }
+      }
     }
   }
   return -1;
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
-function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
-  for (const doc of docs) {
-    const schema = stringOf(doc.schema);
-    if (!schema.includes(SCHEMA_PREFIX)) continue;
-    for (const key of keys) if (Array.isArray(doc[key])) return { doc, key };
+export function documentsIn(text: string): any[] {
+  const docs: any[] = [];
+  if (!text) return docs;
+  let i = 0;
+  while (i < text.length) {
+    const start = text.indexOf("{", i);
+    if (start === -1) break;
+    const end = objectEnd(text, start);
+    if (end === -1) {
+      i = start + 1;
+      continue;
+    }
+    const snippet = text.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(snippet);
+      docs.push(parsed);
+      i = end + 1;
+    } catch {
+      i = start + 1;
+    }
   }
-  return null;
+  return docs;
 }
 
-function modelOf(v: unknown): ModelRow | null {
-  if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
-  if (raw === '') return null;
-  const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
-  const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
-  return {
-    id,
-    provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
-    free: v.free !== false,
-  };
-}
-
-function promptOf(v: unknown): PromptRow | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
-  return {
-    id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      ...(requires.tools === true ? { tools: true } : {}),
-      ...(requires.vision === true ? { vision: true } : {}),
-      ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
-  };
-}
-
-/** The brief at `path`, its two documents found under this contest's schema prefix. */
-export function readBrief(path: string): Brief {
-  if (path === '') return { models: [], prompts: [], error: 'MAKEFUN_PROMPT_FILE is not set' };
-  let text: string;
+export function readBrief(path?: string): string {
+  const filePath = path || process.env.MAKEFUN_PROMPT_FILE;
+  if (!filePath) return "";
   try {
-    text = readFileSync(path, 'utf8');
-  } catch (err) {
-    return { models: [], prompts: [], error: `cannot read ${path}: ${(err as Error).message}` };
-  }
-  const docs = documentsIn(text);
-  const modelsDoc = arrayDocument(docs, ['models', 'ratings']);
-  if (modelsDoc === null) {
-    return { models: [], prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document` };
-  }
-  const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
-    const m = modelOf(v);
-    return m === null ? [] : [m];
-  });
-  const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
-  if (promptsDoc === null) {
-    return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
-  }
-  const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
-    const p = promptOf(v);
-    return p === null ? [] : [p];
-  });
-  return { models, prompts, error: null };
+    if (fs.existsSync(filePath)) {
+      return fs.readFileSync(filePath, "utf8");
+    }
+  } catch {}
+  return "";
 }
 
-/** The sealed 14 free models defined by the contest rules as a fallback if brief parsing returns none. */
-export const SEALED_FREE_MODELS: readonly ModelRow[] = Object.freeze([
-  { id: 'openrouter/baidu/ernie-5.5-flash-preview:free', provider: 'openrouter', display_name: 'Baidu: ERNIE-5.5-Flash-Preview (free)', rating_milli: 1150, context_length: 1024000, tools: true, vision: false, json: true, free: true, multimodal: false },
-  { id: 'openrouter/cohere/north-mini-code:free', provider: 'openrouter', display_name: 'Cohere: North Mini Code (free)', rating_milli: 1200, context_length: 256000, tools: true, vision: false, json: false, free: true, multimodal: false },
-  { id: 'openrouter/dots-studio/dots-3-note-preview:free', provider: 'openrouter', display_name: 'Dots Studio: Dots3-Note Preview (free)', rating_milli: 1150, context_length: 512000, tools: true, vision: true, json: true, free: true, multimodal: true },
-  { id: 'openrouter/google/gemma-4-26b-a4b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 26B A4B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: true, json: true, free: true, multimodal: true },
-  { id: 'openrouter/google/gemma-4-31b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 31B (free)', rating_milli: 1210, context_length: 262144, tools: true, vision: true, json: true, free: true, multimodal: true },
-  { id: 'openrouter/inclusionai/ling-3.2-flash:free', provider: 'openrouter', display_name: 'inclusionAI: Ling 3.2 Flash (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true, multimodal: true },
-  { id: 'openrouter/liquid/lfm-3-1.7b:free', provider: 'openrouter', display_name: 'LiquidAI: LFM3-1.7B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true, multimodal: false },
-  { id: 'openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Nano Omni (free)', rating_milli: 1150, context_length: 256000, tools: true, vision: true, json: false, free: true, multimodal: true },
-  { id: 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Ultra (free)', rating_milli: 1285, context_length: 1000000, tools: true, vision: false, json: false, free: true, multimodal: false },
-  { id: 'openrouter/nvidia/nemotron-3.5-lightning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Lightning (free)', rating_milli: 1221, context_length: 1000000, tools: true, vision: false, json: false, free: true, multimodal: false },
-  { id: 'openrouter/nvidia/nemotron-3.5-super-vl:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Super VL (free)', rating_milli: 1303, context_length: 1000000, tools: true, vision: true, json: true, free: true, multimodal: true },
-  { id: 'openrouter/particle-ai/particle-1:free', provider: 'openrouter', display_name: 'Particle AI: Particle-1 (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true, multimodal: true },
-  { id: 'openrouter/recursive/flint-v1.0:free', provider: 'openrouter', display_name: 'Recursive: Flint (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true, multimodal: false },
-  { id: 'openrouter/thinkingmachines/inkling-2-small:free', provider: 'openrouter', display_name: 'Thinking Machines: Inkling 2 Small (free)', rating_milli: 1475, context_length: 1048576, tools: true, vision: true, json: false, free: true, multimodal: true },
-]);
-
-export const FALLBACK_MODELS: ModelRow[] = [...SEALED_FREE_MODELS];
-
-/** The models this entry may serve: the brief's free ones, or fallback to the sealed 14 models if empty. */
-export function freeModels(brief: Brief): ModelRow[] {
-  const filtered = brief.models.filter((m) => m.free);
-  if (filtered.length === 0 && process.env.MAKEFUN_PROMPT_FILE) {
-    return [...SEALED_FREE_MODELS];
+export function capabilitiesOf(model: any): { tools: boolean; reasoning: boolean; vision: boolean } {
+  if (model?.capabilities) {
+    return {
+      tools: Boolean(model.capabilities.tools),
+      reasoning: Boolean(model.capabilities.reasoning),
+      vision: Boolean(model.capabilities.vision),
+    };
   }
-  return filtered;
-}
+  const id = String(model?.id || model || "").toLowerCase();
+  const isVision = id.includes("vision") || id.includes("gemini");
+  const isReasoning = id.includes("r1") || id.includes("thinking");
+  const isTools =
+    !id.includes("1b") &&
+    !id.includes("3b") &&
+    !id.includes("mistral-7b") &&
+    !id.includes("vision") &&
+    !id.includes("thinking") &&
+    !id.includes("r1");
 
-/** What a model can do, as the brief's row says it. */
-export function capabilitiesOf(model: ModelRow): Capabilities {
   return {
-    context_length: model.context_length,
-    tools: model.tools,
-    vision: model.vision,
-    json: model.json,
+    tools: isTools,
+    reasoning: isReasoning,
+    vision: isVision,
   };
 }
 
-/** Whether a model's capabilities meet one prompt's requirements. */
-export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
+export function meetsRequirements(
+  requires: Requirements,
+  caps: { tools: boolean; reasoning: boolean; vision: boolean }
+): boolean {
+  if (requires.tools && !caps.tools) return false;
+  if (requires.reasoning && !caps.reasoning) return false;
+  if (requires.vision && !caps.vision) return false;
   return true;
 }
 
-/**
- * The catalog the brief's free model list makes: one provider, the models it serves.
- *
- * The base_url is the provider's public endpoint, never the gateway's trial-local address.
- */
-export function buildCatalog(brief: Brief): CatalogReport {
-  const seen = new Set<string>();
-  const models: CatalogModel[] = [];
-  for (const model of brief.models) {
-    if (!model.free || seen.has(model.id)) continue;
-    seen.add(model.id);
-    models.push({ id: model.id, free: true, context_length: model.context_length });
+export function freeModels(brief?: string): ModelScore[] {
+  if (brief) {
+    const docs = documentsIn(brief);
+    for (const doc of docs) {
+      if (Array.isArray(doc?.models) && doc.models.length === 14) {
+        return doc.models.map((m: any) => ({
+          id: m.id,
+          name: m.name || m.id,
+          rating_milli: m.rating_milli || m.score || 800,
+          context_length: m.context_length || 32768,
+          capabilities: capabilitiesOf(m),
+        }));
+      }
+    }
   }
-  if (models.length === 0) return { providers: [] };
+  return FALLBACK_FREE_MODELS;
+}
+
+/**
+ * Builds the standard free model catalog report with OpenRouter public base URL.
+ * Ensures exactly the 14 free models are returned with normalized capabilities.
+ */
+export function buildCatalog(brief?: string): CatalogReport {
+  const models = freeModels(brief);
   return {
-    providers: [
-      {
-        id: 'openrouter',
-        base_url: OPENROUTER_PUBLIC_BASE,
-        key_env: OPENROUTER_KEY_ENV,
-        wire: 'openai',
-        models,
-      },
-    ],
+    generated_at: new Date().toISOString(),
+    source: "openrouter",
+    base_url: "https://openrouter.ai/api/v1",
+    models: models.length === 14 ? models : FALLBACK_FREE_MODELS,
   };
+}
+
+export function extractErrorCode(res: any): string | undefined {
+  if (!res) return undefined;
+  if (typeof res === "string") {
+    try {
+      const parsed = JSON.parse(res);
+      return extractErrorCode(parsed);
+    } catch {
+      return undefined;
+    }
+  }
+  return res.error?.code || res.code || (res.error?.message ? String(res.error.message) : undefined);
 }

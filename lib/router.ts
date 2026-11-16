@@ -1,183 +1,147 @@
-// Quality-first routing and upstream failover engine for free-model-aggregator-02
-import type { ModelRow, PromptRequirements, PromptRow } from './providers.ts';
-
 export interface ModelScore {
-  modelId: string;
-  ratingMilli: number;
-  weight: number;
-  score: number;
+  id: string;
+  name?: string;
+  rating_milli: number;
+  context_length: number;
   capabilities: {
     tools: boolean;
-    json: boolean;
-    multimodal: boolean;
-    contextLength: number;
+    reasoning: boolean;
+    vision: boolean;
   };
 }
 
 export interface FailoverEvent {
-  modelId: string;
-  statusCode: number;
-  errorCode: string;
+  model: string;
+  status: number;
+  code?: string;
   timestamp: number;
-  latencyMs?: number;
 }
 
 export interface UpstreamCooldown {
-  modelId: string;
-  cooldownUntil: number;
-  consecutiveFailures: number;
+  model: string;
+  until: number;
+  failures: number;
+}
+
+export interface Requirements {
+  tools?: boolean;
+  reasoning?: boolean;
+  vision?: boolean;
+  minContext?: number;
 }
 
 export class QualityRouter {
-  private models: ModelRow[];
-  private cooldowns: Map<string, UpstreamCooldown> = new Map();
-  private recentFailures: FailoverEvent[] = [];
-  private readonly defaultCooldownMs: number = 30000;
-  private readonly maxFailuresTracked: number = 8;
+  public cooldowns: Map<string, UpstreamCooldown> = new Map();
+  public recentFailures: FailoverEvent[] = [];
+  public catalog: ModelScore[];
+  public totalRequests: number = 0;
+  public successfulRequests: number = 0;
 
-  constructor(models: ModelRow[]) {
-    this.models = models;
+  constructor(catalog: ModelScore[]) {
+    this.catalog = catalog;
+  }
+
+  public isCoolingDown(modelId: string, now: number = Date.now()): boolean {
+    const cd = this.cooldowns.get(modelId);
+    if (!cd) return false;
+    if (now >= cd.until) {
+      this.cooldowns.delete(modelId);
+      return false;
+    }
+    return true;
   }
 
   /**
-   * Evaluates prompt requirements and ranks candidate models by rating_milli in descending order.
-   * Excludes models currently in cooldown or that fail hard capability requirements.
+   * Selects candidate models meeting the required capabilities,
+   * sorted by rating_milli descending. Ready models are prioritized,
+   * with cooling models appended as a graceful fallback.
    */
-  public selectCandidates(reqs: PromptRequirements = {}, exclude: Set<string> = new Set()): ModelRow[] {
-    const minCtx = reqs.context ?? reqs.min_context ?? 0;
-    const needTools = reqs.tools ?? false;
-    const needJson = reqs.json ?? false;
-    const needVision = reqs.multimodal ?? reqs.vision ?? false;
+  public selectCandidates(reqs: Requirements = {}, exclude: string[] = []): ModelScore[] {
     const now = Date.now();
+    const excludeSet = new Set(exclude);
 
-    const candidates = this.models.filter((m) => {
-      if (exclude.has(m.id)) return false;
-      const cd = this.cooldowns.get(m.id);
-      if (cd && cd.cooldownUntil > now) return false;
-      if (m.context_length !== null && m.context_length < minCtx) return false;
-      if (needTools && !m.tools) return false;
-      if (needJson && !m.json) return false;
-      const mVision = m.multimodal ?? m.vision ?? false;
-      if (needVision && !mVision) return false;
+    const eligible = this.catalog.filter((m) => {
+      if (excludeSet.has(m.id)) return false;
+      if (reqs.tools && !m.capabilities.tools) return false;
+      if (reqs.reasoning && !m.capabilities.reasoning) return false;
+      if (reqs.vision && !m.capabilities.vision) return false;
+      if (reqs.minContext && m.context_length < reqs.minContext) return false;
       return true;
     });
 
-    candidates.sort((a, b) => b.rating_milli - a.rating_milli);
+    const ready: ModelScore[] = [];
+    const cooling: ModelScore[] = [];
 
-    if (candidates.length > 0) return candidates;
+    for (const m of eligible) {
+      if (this.isCoolingDown(m.id, now)) {
+        cooling.push(m);
+      } else {
+        ready.push(m);
+      }
+    }
 
-    // Soft fallback: ignore cooldowns if all models are unavailable
-    const fallback = this.models.filter((m) => {
-      if (exclude.has(m.id)) return false;
-      if (m.context_length !== null && m.context_length < minCtx) return false;
-      if (needTools && !m.tools) return false;
-      if (needJson && !m.json) return false;
-      const mVision = m.multimodal ?? m.vision ?? false;
-      if (needVision && !mVision) return false;
-      return true;
-    });
+    ready.sort((a, b) => b.rating_milli - a.rating_milli);
+    cooling.sort((a, b) => b.rating_milli - a.rating_milli);
 
-    fallback.sort((a, b) => b.rating_milli - a.rating_milli);
-    if (fallback.length > 0) return fallback;
-
-    // Hard fallback: all remaining non-excluded models sorted by rating
-    const remaining = this.models.filter((m) => !exclude.has(m.id));
-    remaining.sort((a, b) => b.rating_milli - a.rating_milli);
-    return remaining.length > 0 ? remaining : this.models;
+    return ready.length > 0 ? ready.concat(cooling) : cooling;
   }
 
-  /**
-   * Records an upstream error or rate limit and places the model on cooldown.
-   */
-  public recordFailure(modelId: string, status: number, code: string, latencyMs?: number): void {
-    const event: FailoverEvent = {
-      modelId,
-      statusCode: status,
-      errorCode: code,
-      timestamp: Date.now(),
-      latencyMs,
-    };
-    this.recentFailures.push(event);
-    if (this.recentFailures.length > this.maxFailuresTracked) {
+  public recordFailure(modelId: string, status: number, code?: string): void {
+    const now = Date.now();
+    const prev = this.cooldowns.get(modelId);
+    const failures = (prev?.failures || 0) + 1;
+    // Exponential backoff: 5s, 10s, 20s, up to 60s max
+    const backoffMs = Math.min(60000, 5000 * Math.pow(2, failures - 1));
+    this.cooldowns.set(modelId, {
+      model: modelId,
+      until: now + backoffMs,
+      failures,
+    });
+
+    this.recentFailures.push({
+      model: modelId,
+      status,
+      code,
+      timestamp: now,
+    });
+
+    if (this.recentFailures.length > 100) {
       this.recentFailures.shift();
     }
-
-    const current = this.cooldowns.get(modelId) ?? {
-      modelId,
-      cooldownUntil: 0,
-      consecutiveFailures: 0,
-    };
-
-    current.consecutiveFailures += 1;
-    const backoffMultiplier = Math.min(4, Math.pow(2, current.consecutiveFailures - 1));
-    current.cooldownUntil = Date.now() + this.defaultCooldownMs * backoffMultiplier;
-    this.cooldowns.set(modelId, current);
   }
 
-  /**
-   * Resets cooldown upon successful completion.
-   */
   public recordSuccess(modelId: string): void {
-    const current = this.cooldowns.get(modelId);
-    if (current && current.consecutiveFailures > 0) {
-      current.consecutiveFailures = 0;
-      current.cooldownUntil = 0;
-      this.cooldowns.set(modelId, current);
-    }
+    this.cooldowns.delete(modelId);
+    this.successfulRequests += 1;
   }
 
-  /**
-   * Returns formatted x-makefun-upstream-failures header payload.
-   */
-  public getFailuresHeader(currentFailures: FailoverEvent[] = []): Record<string, string> {
-    const active = currentFailures.length > 0 ? currentFailures : this.recentFailures;
-    if (active.length === 0) return {};
-    const report = active.slice(-this.maxFailuresTracked).map((f) => ({
-      status: f.statusCode,
-      code: f.errorCode,
-      model: f.modelId,
-    }));
-    return { 'x-makefun-upstream-failures': JSON.stringify(report) };
+  public getFailuresHeader(events?: FailoverEvent[]): string {
+    const list = events ?? this.recentFailures.slice(-10);
+    return JSON.stringify(list.map((e) => ({ model: e.model, status: e.status, code: e.code })));
   }
 
-  /**
-   * Computes quality yield potential for a prompt based on top rated model.
-   */
-  public getQualityYield(prompt: PromptRow, selectedModel: ModelRow, topModel: ModelRow): number {
-    if (topModel.rating_milli <= 0) return 1.0;
-    const ratio = Math.min(1.0, selectedModel.rating_milli / topModel.rating_milli);
-    return ratio * prompt.weight;
+  public getQualityYield(): number {
+    if (this.totalRequests === 0) return 1.0;
+    return this.successfulRequests / this.totalRequests;
   }
 }
 
-/**
- * Validates request payload against OpenAI specification limits.
- */
-export function validateOpenAIRequest(body: Record<string, any>): { valid: boolean; reason?: string } {
-  if (!body || typeof body !== 'object') {
-    return { valid: false, reason: 'Request body must be an object' };
+export function validateOpenAIRequest(body: any): { valid: boolean; error?: string } {
+  if (!body || typeof body !== "object") {
+    return { valid: false, error: "Request body must be a JSON object" };
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return { valid: false, reason: 'messages must be a non-empty array' };
-  }
-  if (body.temperature !== undefined && (typeof body.temperature !== 'number' || body.temperature < 0 || body.temperature > 2)) {
-    return { valid: false, reason: 'temperature must be a number between 0 and 2' };
+    return { valid: false, error: "Missing or empty 'messages' field" };
   }
   return { valid: true };
 }
 
-/**
- * Validates request payload against Anthropic specification limits.
- */
-export function validateAnthropicRequest(body: Record<string, any>): { valid: boolean; reason?: string } {
-  if (!body || typeof body !== 'object') {
-    return { valid: false, reason: 'Request body must be an object' };
+export function validateAnthropicRequest(body: any): { valid: boolean; error?: string } {
+  if (!body || typeof body !== "object") {
+    return { valid: false, error: "Request body must be a JSON object" };
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return { valid: false, reason: 'messages must be a non-empty array' };
-  }
-  if (body.max_tokens !== undefined && (typeof body.max_tokens !== 'number' || body.max_tokens <= 0)) {
-    return { valid: false, reason: 'max_tokens must be a positive integer' };
+    return { valid: false, error: "Missing or empty 'messages' field" };
   }
   return { valid: true };
 }

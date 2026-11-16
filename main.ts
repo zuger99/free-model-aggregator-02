@@ -1,358 +1,489 @@
-// High-performance quality-first multi-wire aggregator for free-model-aggregator-02
-// Implements quality-ranked routing (60%), multi-wire translation (10%), robust failover & retries (10%),
-// exact 14-model catalog (5%), and prompt serving (15%).
-
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import http from "node:http";
+import { QualityRouter, validateOpenAIRequest, validateAnthropicRequest, type FailoverEvent, type Requirements } from "./lib/router.ts";
+import { readBrief, buildCatalog, extractErrorCode, FALLBACK_FREE_MODELS } from "./lib/providers.ts";
 import {
-  buildCatalog,
-  capabilitiesOf,
-  freeModels,
-  isRecord,
-  meetsRequirements,
-  readBrief,
-  type CatalogReport,
-  type Json,
-  type ModelRow,
-  type Requirement,
-} from './lib/providers.ts';
-import {
-  anthropicError,
-  anthropicEventsFromOpenAI,
-  anthropicModelList,
-  anthropicToOpenAI,
-  openAIError,
-  openAIJsonWithModel,
   openAIModelList,
-  openAIStreamWithModel,
+  anthropicModelList,
+  openAIError,
+  anthropicError,
+  anthropicToOpenAI,
   openAIToAnthropic,
-  type ServedModel,
-} from './lib/wire.ts';
-import { QualityRouter, type FailoverEvent } from './lib/router.ts';
+  openAIStreamWithModel,
+  anthropicEventsFromOpenAI,
+} from "./lib/wire.ts";
 
-const PROTOCOL_VERSION = 1;
-const POLL_INTERVAL_MS = 100;
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
-const MAX_FAILURES_REPORTED = 8;
+// 1. CLI --list handler
+if (process.argv.includes("--list")) {
+  const brief = readBrief();
+  const report = buildCatalog(brief);
+  console.log(JSON.stringify(report, null, 2));
+  process.exit(0);
+}
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
-const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
-const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
+const brief = readBrief();
+const catalogReport = buildCatalog(brief);
+const router = new QualityRouter(catalogReport.models);
 
-const brief = readBrief(PROMPT_FILE);
-const catalog: CatalogReport = buildCatalog(brief);
-const router = new QualityRouter(brief.models);
-let manifestIndex = 0;
+const GATEWAY_URL = process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1";
+const GATEWAY_KEY = process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "";
 
-async function extractErrorCode(upstream: Response): Promise<string> {
-  if (upstream.status === 429) return 'rate_limit_exceeded';
-  try {
-    const text = await upstream.text();
-    if (text) {
-      const parsed: unknown = JSON.parse(text);
-      if (isRecord(parsed) && isRecord(parsed.error)) {
-        if (typeof parsed.error.code === 'string' && parsed.error.code !== '') return parsed.error.code;
-        if (typeof parsed.error.type === 'string' && parsed.error.type !== '') return parsed.error.type;
-      }
-    }
-  } catch {
-    // Non-JSON or read error; fallback to standard classification
+function extractApiKey(req: http.IncomingMessage): string | null {
+  const auth = req.headers["authorization"];
+  if (auth && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
   }
-  return upstream.status >= 500 ? 'upstream_error' : 'request_failed';
-}
-
-const failedModels = new Set<string>();
-
-function log(message: string): void {
-  process.stderr.write(`aggregator: ${message}\n`);
-}
-
-function chatCompletionsUrl(): string {
-  if (GATEWAY_URL === '') return '';
-  return GATEWAY_URL.endsWith('/v1') ? `${GATEWAY_URL}/chat/completions` : `${GATEWAY_URL}/v1/chat/completions`;
-}
-
-function servedModels(): ServedModel[] {
-  return freeModels(brief).map((model) => ({ id: model.id, provider: model.provider, display_name: model.display_name }));
-}
-
-function requirementsFor(body: Json): Requirement {
-  const entry = brief.prompts[manifestIndex];
-  manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
-}
-
-function requirementsFromBody(body: Json): Requirement {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
-    }
+  const xApiKey = req.headers["x-api-key"];
+  if (typeof xApiKey === "string" && xApiKey.trim()) {
+    return xApiKey.trim();
   }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
+  return null;
 }
 
-async function readJson(req: IncomingMessage): Promise<Json | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    size += buffer.length;
-    if (size > MAX_BODY_BYTES) return null;
-    chunks.push(buffer);
-  }
-  if (chunks.length === 0) return null;
-  try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    return isRecord(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
+function extractOpenAIRequirements(body: any): Requirements {
+  const hasTools = Boolean(Array.isArray(body.tools) && body.tools.length > 0);
+  let hasVision = false;
+  let hasReasoning = false;
 
-function sendJson(res: ServerResponse, status: number, body: unknown, failures: FailoverEvent[] = []): void {
-  const text = JSON.stringify(body);
-  const headers: Record<string, string | number> = {
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(text),
-    ...router.getFailuresHeader(failures),
-  };
-  res.writeHead(status, headers);
-  res.end(text);
-}
-
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string, failures: FailoverEvent[] = []): void {
-  if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message), failures);
-  else sendJson(res, status, openAIError(message, type, null), failures);
-}
-
-function models(req: IncomingMessage, res: ServerResponse): void {
-  const list = servedModels();
-  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
-  else sendJson(res, 200, openAIModelList(list));
-}
-
-async function dial(model: string, body: Json): Promise<Response> {
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${GATEWAY_KEY}`,
-  };
-  if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
-}
-
-function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, text: string, failures: FailoverEvent[] = []): void {
-  if (wire === 'anthropic') {
-    sendError(res, wire, 502, 'api_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`, failures);
-  } else {
-    sendError(res, wire, 502, 'upstream_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`, failures);
-  }
-}
-
-async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const reqs = requirementsFor(body);
-  const candidates = router.selectCandidates(reqs, failedModels);
-  if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
-
-  const failures: FailoverEvent[] = [];
-  for (const candidate of candidates) {
-    let upstream: Response;
-    const requestBody: Json = { ...body, model: candidate.id };
-    if (body.stream === true) {
-      requestBody.stream_options = { include_usage: true };
-    }
-    try {
-      upstream = await dial(candidate.id, requestBody);
-    } catch (err) {
-      failedModels.add(candidate.id);
-      const code = 'upstream_unreachable';
-      router.recordFailure(candidate.id, 502, code);
-      failures.push({ modelId: candidate.id, statusCode: 502, errorCode: code, timestamp: Date.now() });
-      continue;
-    }
-    if (!upstream.ok || upstream.body === null) {
-      failedModels.add(candidate.id);
-      const code = await extractErrorCode(upstream);
-      router.recordFailure(candidate.id, upstream.status, code);
-      failures.push({ modelId: candidate.id, statusCode: upstream.status, errorCode: code, timestamp: Date.now() });
-      continue;
-    }
-
-    router.recordSuccess(candidate.id);
-
-    if (body.stream === true) {
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-        ...router.getFailuresHeader(failures),
-      });
-      try {
-        for await (const frame of openAIStreamWithModel(upstream.body, candidate.id)) res.write(frame);
-      } finally {
-        res.end();
-      }
-      return;
-    }
-
-    const answer: unknown = await upstream.json();
-    sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, candidate.id), failures);
-    return;
-  }
-
-  const lastFailure = failures[failures.length - 1];
-  refused(res, 'openai', lastFailure?.statusCode ?? 502, 'all free model candidates refused or failed', failures);
-}
-
-async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const reqs = requirementsFor(body);
-  const candidates = router.selectCandidates(reqs, failedModels);
-  if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
-
-  const failures: FailoverEvent[] = [];
-  for (const candidate of candidates) {
-    let upstream: Response;
-    try {
-      upstream = await dial(candidate.id, anthropicToOpenAI(body, candidate.id));
-    } catch (err) {
-      failedModels.add(candidate.id);
-      const code = 'api_error';
-      router.recordFailure(candidate.id, 502, code);
-      failures.push({ modelId: candidate.id, statusCode: 502, errorCode: code, timestamp: Date.now() });
-      continue;
-    }
-    if (!upstream.ok || upstream.body === null) {
-      failedModels.add(candidate.id);
-      const code = await extractErrorCode(upstream);
-      router.recordFailure(candidate.id, upstream.status, code);
-      failures.push({ modelId: candidate.id, statusCode: upstream.status, errorCode: code, timestamp: Date.now() });
-      continue;
-    }
-
-    router.recordSuccess(candidate.id);
-
-    if (body.stream === true) {
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-        ...router.getFailuresHeader(failures),
-      });
-      try {
-        for await (const event of anthropicEventsFromOpenAI(upstream.body, candidate.id)) res.write(event);
-      } finally {
-        res.end();
-      }
-      return;
-    }
-
-    const answer: unknown = await upstream.json();
-    sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, candidate.id), failures);
-    return;
-  }
-
-  const lastFailure = failures[failures.length - 1];
-  refused(res, 'anthropic', lastFailure?.statusCode ?? 502, 'all free model candidates refused or failed', failures);
-}
-
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://entry');
-  if (req.method === 'GET' && url.pathname === '/v1/models') {
-    models(req, res);
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-    await chat(req, res);
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    await messages(req, res);
-    return;
-  }
-  sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
-}
-
-function listen(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '0.0.0.0', () => resolve());
-  });
-}
-
-async function register(port: number, report: CatalogReport): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const reply: unknown = await res.json();
-  if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
-}
-
-function poll(server: Server): void {
-  let inFlight = false;
-  const timer = setInterval(() => {
-    if (inFlight) return;
-    inFlight = true;
-    void (async () => {
-      try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === "image_url") hasVision = true;
         }
-      } catch {
-        // Retry next tick
-      } finally {
-        inFlight = false;
       }
-    })();
-  }, POLL_INTERVAL_MS);
-}
-
-async function start(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  if (process.argv.includes('--list')) {
-    const text = `${JSON.stringify(catalog)}\n`;
-    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
-    process.exit(0);
+    }
   }
-  if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  if (chatCompletionsUrl() === '') throw new Error('OPENAI_BASE_URL is not set');
-  const server = createServer((req, res) => {
-    void handle(req, res).catch((err: unknown) => {
-      log((err as Error).stack ?? String(err));
-      if (!res.headersSent) sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
-    });
-  });
-  await listen(server);
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server has no port');
-  const port = address.port;
-  if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
-  await register(port, catalog);
-  process.on('SIGTERM', () => process.exit(0));
-  process.on('SIGINT', () => process.exit(0));
-  poll(server);
+
+  if (typeof body.model === "string") {
+    const m = body.model.toLowerCase();
+    if (m.includes("r1") || m.includes("thinking") || m.includes("reasoning")) {
+      hasReasoning = true;
+    }
+    if (m.includes("vision")) {
+      hasVision = true;
+    }
+  }
+
+  return {
+    tools: hasTools,
+    vision: hasVision,
+    reasoning: hasReasoning,
+    minContext: typeof body.max_tokens === "number" ? body.max_tokens * 2 : undefined,
+  };
 }
 
-try {
-  await start();
-} catch (err) {
-  log((err as Error).stack ?? String(err));
-  process.exit(1);
+function extractAnthropicRequirements(body: any): Requirements {
+  const hasTools = Boolean(Array.isArray(body.tools) && body.tools.length > 0);
+  let hasVision = false;
+  let hasReasoning = false;
+
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === "image") hasVision = true;
+        }
+      }
+    }
+  }
+
+  if (typeof body.model === "string") {
+    const m = body.model.toLowerCase();
+    if (m.includes("r1") || m.includes("thinking") || m.includes("reasoning")) {
+      hasReasoning = true;
+    }
+    if (m.includes("vision")) {
+      hasVision = true;
+    }
+  }
+
+  return {
+    tools: hasTools,
+    vision: hasVision,
+    reasoning: hasReasoning,
+  };
 }
+
+async function parseBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      if (!raw.trim()) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, x-api-key, anthropic-version"
+  );
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const pathname = url.pathname;
+
+  if (pathname === "/health" || pathname === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", models: catalogReport.models.length }));
+    return;
+  }
+
+  // GET /v1/models
+  if (req.method === "GET" && pathname === "/v1/models") {
+    const token = extractApiKey(req);
+    res.setHeader("x-makefun-quality-yield", router.getQualityYield().toFixed(4));
+    const anthropicVersion = req.headers["anthropic-version"];
+    if (anthropicVersion) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(anthropicModelList(catalogReport.models)));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(openAIModelList(catalogReport.models)));
+    return;
+  }
+
+  // POST /v1/chat/completions
+  if (req.method === "POST" && pathname === "/v1/chat/completions") {
+    let body: any;
+    try {
+      body = await parseBody(req);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(openAIError(400, "Invalid JSON body")));
+      return;
+    }
+
+    const validation = validateOpenAIRequest(body);
+    if (!validation.valid) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(openAIError(400, validation.error || "Bad Request")));
+      return;
+    }
+
+    const reqs = extractOpenAIRequirements(body);
+    let candidates = router.selectCandidates(reqs);
+
+    if (body.model && catalogReport.models.some((m) => m.id === body.model)) {
+      const preferred = catalogReport.models.find((m) => m.id === body.model)!;
+      candidates = [preferred, ...candidates.filter((m) => m.id !== preferred.id)];
+    }
+
+    if (candidates.length === 0) {
+      candidates = router.selectCandidates({});
+    }
+    if (candidates.length === 0) {
+      candidates = catalogReport.models;
+    }
+
+    const failoverEvents: FailoverEvent[] = [];
+    let lastStatus = 502;
+
+    const reqHeaders: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (GATEWAY_KEY) {
+      reqHeaders["authorization"] = `Bearer ${GATEWAY_KEY}`;
+    }
+
+    for (const candidate of candidates) {
+      const payload = {
+        ...body,
+        model: candidate.id,
+      };
+
+      try {
+        const upstreamRes = await fetch(`${GATEWAY_URL.replace(/\/+$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: reqHeaders,
+          body: JSON.stringify(payload),
+        });
+
+        if (upstreamRes.status === 429 || upstreamRes.status >= 500) {
+          let code: string | undefined;
+          try {
+            const errJson = await upstreamRes.json();
+            code = extractErrorCode(errJson);
+          } catch {
+            code = `HTTP_${upstreamRes.status}`;
+          }
+          router.recordFailure(candidate.id, upstreamRes.status, code);
+          failoverEvents.push({
+            model: candidate.id,
+            status: upstreamRes.status,
+            code,
+            timestamp: Date.now(),
+          });
+          lastStatus = upstreamRes.status;
+          continue;
+        }
+
+        if (!upstreamRes.ok) {
+          const errText = await upstreamRes.text();
+          res.writeHead(upstreamRes.status, {
+            "content-type": upstreamRes.headers.get("content-type") || "application/json",
+            "x-makefun-upstream-failures": router.getFailuresHeader(failoverEvents),
+          });
+          res.end(errText);
+          return;
+        }
+
+        router.recordSuccess(candidate.id);
+        const failuresHeader = router.getFailuresHeader(failoverEvents);
+        res.setHeader("x-makefun-quality-yield", router.getQualityYield().toFixed(4));
+
+        if (body.stream) {
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+            "x-makefun-upstream-failures": failuresHeader,
+          });
+
+          if (!upstreamRes.body) {
+            res.end();
+            return;
+          }
+
+          for await (const chunk of openAIStreamWithModel(upstreamRes.body, candidate.id)) {
+            res.write(chunk);
+          }
+          res.end();
+          return;
+        } else {
+          const data = await upstreamRes.json();
+          data.model = candidate.id;
+          res.writeHead(200, {
+            "content-type": "application/json; charset=utf-8",
+            "x-makefun-upstream-failures": failuresHeader,
+          });
+          res.end(JSON.stringify(data));
+          return;
+        }
+      } catch (err: any) {
+        router.recordFailure(candidate.id, 503, err.message || "FETCH_ERROR");
+        failoverEvents.push({
+          model: candidate.id,
+          status: 503,
+          code: "UPSTREAM_DIAL_FAILED",
+          timestamp: Date.now(),
+        });
+        continue;
+      }
+    }
+
+    res.writeHead(lastStatus, {
+      "content-type": "application/json",
+      "x-makefun-upstream-failures": router.getFailuresHeader(failoverEvents),
+    });
+    res.end(
+      JSON.stringify(openAIError(lastStatus, "All upstream model candidates failed", "api_error"))
+    );
+    return;
+  }
+
+  // POST /v1/messages
+  if (req.method === "POST" && pathname === "/v1/messages") {
+    let body: any;
+    try {
+      body = await parseBody(req);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(anthropicError(400, "Invalid JSON body", "invalid_request_error")));
+      return;
+    }
+
+    const validation = validateAnthropicRequest(body);
+    if (!validation.valid) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          anthropicError(400, validation.error || "Bad Request", "invalid_request_error")
+        )
+      );
+      return;
+    }
+
+    const reqs = extractAnthropicRequirements(body);
+    let candidates = router.selectCandidates(reqs);
+
+    if (body.model && catalogReport.models.some((m) => m.id === body.model)) {
+      const preferred = catalogReport.models.find((m) => m.id === body.model)!;
+      candidates = [preferred, ...candidates.filter((m) => m.id !== preferred.id)];
+    }
+
+    if (candidates.length === 0) {
+      candidates = router.selectCandidates({});
+    }
+    if (candidates.length === 0) {
+      candidates = catalogReport.models;
+    }
+
+    const failoverEvents: FailoverEvent[] = [];
+    let lastStatus = 502;
+
+    const reqHeaders: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (GATEWAY_KEY) {
+      reqHeaders["authorization"] = `Bearer ${GATEWAY_KEY}`;
+    }
+
+    for (const candidate of candidates) {
+      const openAIPayload = anthropicToOpenAI(body, candidate.id);
+
+      try {
+        const upstreamRes = await fetch(`${GATEWAY_URL.replace(/\/+$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: reqHeaders,
+          body: JSON.stringify(openAIPayload),
+        });
+
+        if (upstreamRes.status === 429 || upstreamRes.status >= 500) {
+          let code: string | undefined;
+          try {
+            const errJson = await upstreamRes.json();
+            code = extractErrorCode(errJson);
+          } catch {
+            code = `HTTP_${upstreamRes.status}`;
+          }
+          router.recordFailure(candidate.id, upstreamRes.status, code);
+          failoverEvents.push({
+            model: candidate.id,
+            status: upstreamRes.status,
+            code,
+            timestamp: Date.now(),
+          });
+          lastStatus = upstreamRes.status;
+          continue;
+        }
+
+        if (!upstreamRes.ok) {
+          const errText = await upstreamRes.text();
+          res.writeHead(upstreamRes.status, {
+            "content-type": "application/json",
+            "x-makefun-upstream-failures": router.getFailuresHeader(failoverEvents),
+          });
+          res.end(JSON.stringify(anthropicError(upstreamRes.status, errText, "api_error")));
+          return;
+        }
+
+        router.recordSuccess(candidate.id);
+        const failuresHeader = router.getFailuresHeader(failoverEvents);
+        res.setHeader("x-makefun-quality-yield", router.getQualityYield().toFixed(4));
+
+        if (body.stream) {
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+            "x-makefun-upstream-failures": failuresHeader,
+          });
+
+          if (!upstreamRes.body) {
+            res.end();
+            return;
+          }
+
+          for await (const chunk of anthropicEventsFromOpenAI(upstreamRes.body, candidate.id)) {
+            res.write(chunk);
+          }
+          res.end();
+          return;
+        } else {
+          const data = await upstreamRes.json();
+          const anthropicData = openAIToAnthropic(data, candidate.id);
+          res.writeHead(200, {
+            "content-type": "application/json; charset=utf-8",
+            "x-makefun-upstream-failures": failuresHeader,
+          });
+          res.end(JSON.stringify(anthropicData));
+          return;
+        }
+      } catch (err: any) {
+        router.recordFailure(candidate.id, 503, err.message || "FETCH_ERROR");
+        failoverEvents.push({
+          model: candidate.id,
+          status: 503,
+          code: "UPSTREAM_DIAL_FAILED",
+          timestamp: Date.now(),
+        });
+        continue;
+      }
+    }
+
+    res.writeHead(lastStatus, {
+      "content-type": "application/json",
+      "x-makefun-upstream-failures": router.getFailuresHeader(failoverEvents),
+    });
+    res.end(
+      JSON.stringify(anthropicError(lastStatus, "All upstream model candidates failed", "api_error"))
+    );
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not Found" }));
+});
+
+const requestedPort = parseInt(process.env.PORT || "0", 10) || 0;
+server.listen(requestedPort, "0.0.0.0", async () => {
+  const address = server.address();
+  const actualPort = typeof address === "object" && address ? address.port : requestedPort;
+  console.log(`free-model-aggregator listening on port ${actualPort}`);
+
+  const envUrl = process.env.MAKEFUN_ENV_URL;
+  if (envUrl) {
+    try {
+      const regUrl = `${envUrl.replace(/\/+$/, "")}/register`;
+      const regRes = await fetch(regUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          port: actualPort,
+          url: `http://localhost:${actualPort}`,
+        }),
+      });
+      console.log(`Registered with environment at ${regUrl}: ${regRes.status}`);
+    } catch (err: any) {
+      console.error(`Registration failed:`, err.message);
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const workUrl = `${envUrl.replace(/\/+$/, "")}/work`;
+        const res = await fetch(workUrl);
+        if (res.ok) {
+          const data: any = await res.json();
+          if (data && data.done === true) {
+            console.log("Work complete signal received. Exiting.");
+            clearInterval(pollInterval);
+            server.close(() => {
+              process.exit(0);
+            });
+          }
+        }
+      } catch {}
+    }, 500);
+  }
+});
