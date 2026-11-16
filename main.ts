@@ -27,6 +27,7 @@ import {
   openAIToAnthropic,
   type ServedModel,
 } from './lib/wire.ts';
+import { QualityRouter, type FailoverEvent } from './lib/router.ts';
 
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
@@ -40,13 +41,8 @@ const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
 
 const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
+const router = new QualityRouter(brief.models);
 let manifestIndex = 0;
-
-interface UpstreamFailure {
-  status: number;
-  code: string;
-  model: string | null;
-}
 
 async function extractErrorCode(upstream: Response): Promise<string> {
   if (upstream.status === 429) return 'rate_limit_exceeded';
@@ -78,19 +74,6 @@ function chatCompletionsUrl(): string {
 
 function servedModels(): ServedModel[] {
   return freeModels(brief).map((model) => ({ id: model.id, provider: model.provider, display_name: model.display_name }));
-}
-
-/**
- * Quality-ranked candidates:
- * 1. Filter free models meeting requirements.
- * 2. Sort descending by rating_milli (quality 60%).
- * 3. Prefer models that have not failed (cooldowns/rate limits).
- */
-function rankedCandidatesFor(requires: Requirement): ModelRow[] {
-  const models = freeModels(brief).filter((m) => meetsRequirements(requires, capabilitiesOf(m)));
-  const sorted = [...models].sort((a, b) => b.rating_milli - a.rating_milli);
-  const active = sorted.filter((m) => !failedModels.has(m.id));
-  return active.length > 0 ? active : sorted;
 }
 
 function requirementsFor(body: Json): Requirement {
@@ -131,20 +114,18 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, failures: UpstreamFailure[] = []): void {
+function sendJson(res: ServerResponse, status: number, body: unknown, failures: FailoverEvent[] = []): void {
   const text = JSON.stringify(body);
   const headers: Record<string, string | number> = {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(text),
+    ...router.getFailuresHeader(failures),
   };
-  if (failures.length > 0) {
-    headers['x-makefun-upstream-failures'] = JSON.stringify(failures.slice(0, MAX_FAILURES_REPORTED));
-  }
   res.writeHead(status, headers);
   res.end(text);
 }
 
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string, failures: UpstreamFailure[] = []): void {
+function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string, failures: FailoverEvent[] = []): void {
   if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message), failures);
   else sendJson(res, status, openAIError(message, type, null), failures);
 }
@@ -164,7 +145,7 @@ async function dial(model: string, body: Json): Promise<Response> {
   return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
 }
 
-function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, text: string, failures: UpstreamFailure[] = []): void {
+function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, text: string, failures: FailoverEvent[] = []): void {
   if (wire === 'anthropic') {
     sendError(res, wire, 502, 'api_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`, failures);
   } else {
@@ -176,10 +157,10 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const reqs = requirementsFor(body);
-  const candidates = rankedCandidatesFor(reqs);
+  const candidates = router.selectCandidates(reqs, failedModels);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
 
-  const failures: UpstreamFailure[] = [];
+  const failures: FailoverEvent[] = [];
   for (const candidate of candidates) {
     let upstream: Response;
     const requestBody: Json = { ...body, model: candidate.id };
@@ -190,22 +171,27 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       upstream = await dial(candidate.id, requestBody);
     } catch (err) {
       failedModels.add(candidate.id);
-      failures.push({ status: 502, code: 'upstream_unreachable', model: candidate.id });
+      const code = 'upstream_unreachable';
+      router.recordFailure(candidate.id, 502, code);
+      failures.push({ modelId: candidate.id, statusCode: 502, errorCode: code, timestamp: Date.now() });
       continue;
     }
     if (!upstream.ok || upstream.body === null) {
       failedModels.add(candidate.id);
       const code = await extractErrorCode(upstream);
-      failures.push({ status: upstream.status, code, model: candidate.id });
+      router.recordFailure(candidate.id, upstream.status, code);
+      failures.push({ modelId: candidate.id, statusCode: upstream.status, errorCode: code, timestamp: Date.now() });
       continue;
     }
+
+    router.recordSuccess(candidate.id);
 
     if (body.stream === true) {
       res.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
-        ...(failures.length > 0 ? { 'x-makefun-upstream-failures': JSON.stringify(failures.slice(0, MAX_FAILURES_REPORTED)) } : {}),
+        ...router.getFailuresHeader(failures),
       });
       try {
         for await (const frame of openAIStreamWithModel(upstream.body, candidate.id)) res.write(frame);
@@ -221,39 +207,44 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   const lastFailure = failures[failures.length - 1];
-  refused(res, 'openai', lastFailure?.status ?? 502, 'all free model candidates refused or failed', failures);
+  refused(res, 'openai', lastFailure?.statusCode ?? 502, 'all free model candidates refused or failed', failures);
 }
 
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const reqs = requirementsFor(body);
-  const candidates = rankedCandidatesFor(reqs);
+  const candidates = router.selectCandidates(reqs, failedModels);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
 
-  const failures: UpstreamFailure[] = [];
+  const failures: FailoverEvent[] = [];
   for (const candidate of candidates) {
     let upstream: Response;
     try {
       upstream = await dial(candidate.id, anthropicToOpenAI(body, candidate.id));
     } catch (err) {
       failedModels.add(candidate.id);
-      failures.push({ status: 502, code: 'api_error', model: candidate.id });
+      const code = 'api_error';
+      router.recordFailure(candidate.id, 502, code);
+      failures.push({ modelId: candidate.id, statusCode: 502, errorCode: code, timestamp: Date.now() });
       continue;
     }
     if (!upstream.ok || upstream.body === null) {
       failedModels.add(candidate.id);
       const code = await extractErrorCode(upstream);
-      failures.push({ status: upstream.status, code, model: candidate.id });
+      router.recordFailure(candidate.id, upstream.status, code);
+      failures.push({ modelId: candidate.id, statusCode: upstream.status, errorCode: code, timestamp: Date.now() });
       continue;
     }
+
+    router.recordSuccess(candidate.id);
 
     if (body.stream === true) {
       res.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
-        ...(failures.length > 0 ? { 'x-makefun-upstream-failures': JSON.stringify(failures.slice(0, MAX_FAILURES_REPORTED)) } : {}),
+        ...router.getFailuresHeader(failures),
       });
       try {
         for await (const event of anthropicEventsFromOpenAI(upstream.body, candidate.id)) res.write(event);
@@ -269,7 +260,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   }
 
   const lastFailure = failures[failures.length - 1];
-  refused(res, 'anthropic', lastFailure?.status ?? 502, 'all free model candidates refused or failed', failures);
+  refused(res, 'anthropic', lastFailure?.statusCode ?? 502, 'all free model candidates refused or failed', failures);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

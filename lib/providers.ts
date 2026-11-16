@@ -1,19 +1,4 @@
-// The brief's two documents, the free model list, and the catalog.
-//
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the
-// prose around them does not matter: this file finds each by its `schema` member, under this contest's
-// prefix (`free-model-aggregator-02/`).
-//
-//   - the free model list (`free-model-aggregator-02/models/v1`): one row a model, keyed by the id the
-//     gateway routes (`openrouter/<vendor>/<model>:free`), with the model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
-//     free model may serve a prompt; this baseline never routes a paid one.
-//   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
-//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its
-//     weight (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
-//     this baseline routes each arrival by its row, which is why the prompt list is read before the
-//     first request.
-
+// Provider catalog and brief parser for free-model-aggregator-02
 import { readFileSync } from 'node:fs';
 
 export const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
@@ -41,6 +26,7 @@ export interface ModelRow {
   vision: boolean | null;
   json: boolean | null;
   free: boolean;
+  multimodal?: boolean | null;
 }
 
 /** What one prompt needs: a model without it cannot serve the prompt. */
@@ -49,7 +35,11 @@ export interface Requirement {
   vision?: boolean;
   json?: boolean;
   min_context?: number;
+  context?: number;
+  multimodal?: boolean;
 }
+
+export type PromptRequirements = Requirement;
 
 /** One prompt the client will send, as the brief lists it. */
 export interface PromptRow {
@@ -221,21 +211,23 @@ export function readBrief(path: string): Brief {
 
 /** The sealed 14 free models defined by the contest rules as a fallback if brief parsing returns none. */
 export const SEALED_FREE_MODELS: readonly ModelRow[] = Object.freeze([
-  { id: 'openrouter/baidu/ernie-5.5-flash-preview:free', provider: 'openrouter', display_name: 'Baidu: ERNIE-5.5-Flash-Preview (free)', rating_milli: 1150, context_length: 1024000, tools: true, vision: false, json: true, free: true },
-  { id: 'openrouter/cohere/north-mini-code:free', provider: 'openrouter', display_name: 'Cohere: North Mini Code (free)', rating_milli: 1200, context_length: 256000, tools: true, vision: false, json: false, free: true },
-  { id: 'openrouter/dots-studio/dots-3-note-preview:free', provider: 'openrouter', display_name: 'Dots Studio: Dots3-Note Preview (free)', rating_milli: 1150, context_length: 512000, tools: true, vision: true, json: true, free: true },
-  { id: 'openrouter/google/gemma-4-26b-a4b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 26B A4B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: true, json: true, free: true },
-  { id: 'openrouter/google/gemma-4-31b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 31B (free)', rating_milli: 1210, context_length: 262144, tools: true, vision: true, json: true, free: true },
-  { id: 'openrouter/inclusionai/ling-3.2-flash:free', provider: 'openrouter', display_name: 'inclusionAI: Ling 3.2 Flash (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true },
-  { id: 'openrouter/liquid/lfm-3-1.7b:free', provider: 'openrouter', display_name: 'LiquidAI: LFM3-1.7B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true },
-  { id: 'openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Nano Omni (free)', rating_milli: 1150, context_length: 256000, tools: true, vision: true, json: false, free: true },
-  { id: 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Ultra (free)', rating_milli: 1285, context_length: 1000000, tools: true, vision: false, json: false, free: true },
-  { id: 'openrouter/nvidia/nemotron-3.5-lightning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Lightning (free)', rating_milli: 1221, context_length: 1000000, tools: true, vision: false, json: false, free: true },
-  { id: 'openrouter/nvidia/nemotron-3.5-super-vl:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Super VL (free)', rating_milli: 1303, context_length: 1000000, tools: true, vision: true, json: true, free: true },
-  { id: 'openrouter/particle-ai/particle-1:free', provider: 'openrouter', display_name: 'Particle AI: Particle-1 (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true },
-  { id: 'openrouter/recursive/flint-v1.0:free', provider: 'openrouter', display_name: 'Recursive: Flint (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true },
-  { id: 'openrouter/thinkingmachines/inkling-2-small:free', provider: 'openrouter', display_name: 'Thinking Machines: Inkling 2 Small (free)', rating_milli: 1475, context_length: 1048576, tools: true, vision: true, json: false, free: true },
+  { id: 'openrouter/baidu/ernie-5.5-flash-preview:free', provider: 'openrouter', display_name: 'Baidu: ERNIE-5.5-Flash-Preview (free)', rating_milli: 1150, context_length: 1024000, tools: true, vision: false, json: true, free: true, multimodal: false },
+  { id: 'openrouter/cohere/north-mini-code:free', provider: 'openrouter', display_name: 'Cohere: North Mini Code (free)', rating_milli: 1200, context_length: 256000, tools: true, vision: false, json: false, free: true, multimodal: false },
+  { id: 'openrouter/dots-studio/dots-3-note-preview:free', provider: 'openrouter', display_name: 'Dots Studio: Dots3-Note Preview (free)', rating_milli: 1150, context_length: 512000, tools: true, vision: true, json: true, free: true, multimodal: true },
+  { id: 'openrouter/google/gemma-4-26b-a4b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 26B A4B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: true, json: true, free: true, multimodal: true },
+  { id: 'openrouter/google/gemma-4-31b-it:free', provider: 'openrouter', display_name: 'Google: Gemma 4 31B (free)', rating_milli: 1210, context_length: 262144, tools: true, vision: true, json: true, free: true, multimodal: true },
+  { id: 'openrouter/inclusionai/ling-3.2-flash:free', provider: 'openrouter', display_name: 'inclusionAI: Ling 3.2 Flash (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true, multimodal: true },
+  { id: 'openrouter/liquid/lfm-3-1.7b:free', provider: 'openrouter', display_name: 'LiquidAI: LFM3-1.7B (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true, multimodal: false },
+  { id: 'openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Nano Omni (free)', rating_milli: 1150, context_length: 256000, tools: true, vision: true, json: false, free: true, multimodal: true },
+  { id: 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3 Ultra (free)', rating_milli: 1285, context_length: 1000000, tools: true, vision: false, json: false, free: true, multimodal: false },
+  { id: 'openrouter/nvidia/nemotron-3.5-lightning:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Lightning (free)', rating_milli: 1221, context_length: 1000000, tools: true, vision: false, json: false, free: true, multimodal: false },
+  { id: 'openrouter/nvidia/nemotron-3.5-super-vl:free', provider: 'openrouter', display_name: 'NVIDIA: Nemotron 3.5 Super VL (free)', rating_milli: 1303, context_length: 1000000, tools: true, vision: true, json: true, free: true, multimodal: true },
+  { id: 'openrouter/particle-ai/particle-1:free', provider: 'openrouter', display_name: 'Particle AI: Particle-1 (free)', rating_milli: 1150, context_length: 1048576, tools: true, vision: true, json: true, free: true, multimodal: true },
+  { id: 'openrouter/recursive/flint-v1.0:free', provider: 'openrouter', display_name: 'Recursive: Flint (free)', rating_milli: 1150, context_length: 262144, tools: true, vision: false, json: true, free: true, multimodal: false },
+  { id: 'openrouter/thinkingmachines/inkling-2-small:free', provider: 'openrouter', display_name: 'Thinking Machines: Inkling 2 Small (free)', rating_milli: 1475, context_length: 1048576, tools: true, vision: true, json: false, free: true, multimodal: true },
 ]);
+
+export const FALLBACK_MODELS: ModelRow[] = [...SEALED_FREE_MODELS];
 
 /** The models this entry may serve: the brief's free ones, or fallback to the sealed 14 models if empty. */
 export function freeModels(brief: Brief): ModelRow[] {

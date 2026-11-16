@@ -1,18 +1,4 @@
-// The client wires, the one upstream wire, and the model field.
-//
-// The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an Anthropic
-// one (POST /v1/messages), with a JSON body or with server-sent events. The entry dials the grader's
-// gateway, an OpenAI-compatible endpoint, so every prompt goes upstream as a Chat Completions request
-// and the Anthropic path is translated both ways:
-//
-//   - the OpenAI path passes the client's body (with the dialled model's id) to the gateway and relays
-//     the gateway's JSON or SSE answer, with every `model` field set to the id this entry dialled;
-//   - the Anthropic path rewrites the request to Chat Completions (system prompt, image blocks, tool
-//     definitions, tool results and tool choice included) and rewrites the gateway's answer into a
-//     Messages object, or into the message_start / content_block_start / content_block_delta /
-//     content_block_stop / message_delta / message_stop event order, with the stop reason and the usage
-//     translated. Tool calls become tool_use blocks and input_json_delta events.
-
+// Multi-wire protocol translator and stream generator for free-model-aggregator-02
 import { isRecord, type Json } from './providers.ts';
 
 /** One model the entry serves, as GET /v1/models lists it. */
